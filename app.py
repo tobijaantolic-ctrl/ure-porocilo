@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
 from pypdf import PdfReader
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -20,7 +20,7 @@ st.markdown("Naloži **PDF poročilo učitelja** in prejmi Excel datoteko z raz�
 # ── Gemini setup ──────────────────────────────────────────────────────────────
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 except Exception:
     st.error("⚠️ Gemini API ključ ni nastavljen. Kontaktiraj administratorja.")
     st.stop()
@@ -95,10 +95,11 @@ Poročilo:
 """
 
 def parse_pdf(text: str) -> dict:
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(PROMPT.format(text=text))
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=PROMPT.format(text=text),
+    )
     raw = response.text.strip()
-    # Strip markdown fences if present
     raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
     return json.loads(raw)
 
