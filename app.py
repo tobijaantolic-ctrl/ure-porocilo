@@ -40,9 +40,9 @@ def _widths(ws, widths):
     for col, w in zip("ABCDEFGH", widths):
         ws.column_dimensions[col].width = w
 
-# ── Counting rules ────────────────────────────────────────────────────────────
+# ── Counting rule ─────────────────────────────────────────────────────────────
 def ped_ure(decimal: float) -> int:
-    """Pedagoška ura: vsaka začeta 45-minutna enota = 1 ura (ceil(h/0.75))."""
+    """Pedagoška ura: vsaka začeta 45-min enota = 1. Formula: ceil(h / 0.75)"""
     return max(1, math.ceil(decimal / 0.75))
 
 # ── Naziv cleanup ─────────────────────────────────────────────────────────────
@@ -50,7 +50,6 @@ def clean_naziv(raw: str) -> str:
     n = raw.strip()
     if n.lower().startswith("wau "):
         n = n[4:].strip()
-    # Strip trailing simple group number like "3." "0." "11." "15."
     n = re.sub(r'\s+\d+\.\s*$', '', n).strip()
     return n
 
@@ -63,13 +62,13 @@ def extract_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
-# Regex — NO re.DOTALL: prevents false matches on header dates spanning lines
+# No re.DOTALL — prepreči napačno ujemanje datumov iz glave PDF-ja
 PATTERN = re.compile(
-    r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'   # date
-    r'\s+([^\n\r]+?)'                       # naziv + group (same line only)
-    r'\s+\d+h\s+\d+m'                       # hh mm (discarded)
-    r'\s+\((\d+(?:[.,]\d+)?)\)'             # (decimal or integer hours)
-    r'\s+(Sistemizirana|Nesistemizirana)'    # type
+    r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'   # datum
+    r'\s+([^\n\r]+?)'                       # naziv + skupina (samo ena vrstica)
+    r'\s+\d+h\s+\d+m'                       # čas v urah in minutah (zavržemo)
+    r'\s+\((\d+(?:[.,]\d+)?)\)'             # (decimalno ali celo število ur)
+    r'\s+(Sistemizirana|Nesistemizirana)'    # tip dejavnosti
 )
 
 def parse_pdf(text: str) -> dict:
@@ -88,32 +87,30 @@ def parse_pdf(text: str) -> dict:
         datum     = re.sub(r'\s+', '', raw_datum)
         ure       = float(ure_str.replace(',', '.'))
         naziv_low = raw_naziv.strip().lower()
+        is_wau    = naziv_low.startswith("wau")
+        is_rap    = bool(re.search(r'\brap\b', naziv_low))
 
-        is_wau  = naziv_low.startswith("wau")
-        is_sist = (dejavnost == "Sistemizirana")
-        is_rap  = bool(re.search(r'\brap\b', naziv_low))
-
-        if is_wau or not is_sist:
-            # WAU = nepedagoške ure → dejanski čas
+        if is_wau:
+            # WAU = SAMO dejavnosti z "wau" predpono → dejanski čas
             wau_list.append({
                 "datum": datum,
                 "opis":  clean_naziv(raw_naziv.strip()),
                 "ure":   ure,
             })
         elif is_rap:
-            # RAP / RaP PS / RaP RS → pedagoške ure, zaokroženo
+            # RAP / RaP PS / RaP RS → pedagoška ura, zaokroženo navzgor
             rap_ps.append({
-                "datum":   datum,
-                "naziv":   rap_naziv(raw_naziv.strip()),
-                "ure_st":  ped_ure(ure),
+                "datum":  datum,
+                "naziv":  rap_naziv(raw_naziv.strip()),
+                "ure_st": ped_ure(ure),
             })
         else:
-            # Ostale sistemizirana (Knjižnična vzgoja, Halo Katra …) → pedagoške
+            # VSE ostalo (sistemizirana ALI nesistemizirana, brez "wau") → pedagoška ura
             dirka.append({
-                "datum":      datum,
-                "naziv":      clean_naziv(raw_naziv.strip()),
-                "dejavnost":  dejavnost,
-                "ure_st":     ped_ure(ure),
+                "datum":     datum,
+                "naziv":     clean_naziv(raw_naziv.strip()),
+                "dejavnost": dejavnost,
+                "ure_st":    ped_ure(ure),
             })
 
     return {
@@ -143,7 +140,7 @@ def build_excel(data: dict) -> bytes:
     _t(ws1.cell(tr1,3), f"=SUM(C2:C{tr1-1})", "0")
     _widths(ws1, [14, 22, 20])
 
-    # Sheet 2 — Dirka za branje / ostale pedagoške
+    # Sheet 2 — Dirka za branje / vse ostale pedagoške ure
     ws2 = wb.create_sheet("Dirka_za_branje")
     for c, h in enumerate(["Datum", "Naziv", "Dejavnost", "Ure (upoštevano)"], 1): _h(ws2.cell(1,c), h)
     for i, r in enumerate(dirka):
@@ -156,7 +153,7 @@ def build_excel(data: dict) -> bytes:
     _t(ws2.cell(tr2,4), f"=SUM(D2:D{tr2-1})", "0")
     _widths(ws2, [14, 36, 18, 20])
 
-    # Sheet 3 — WAU (dejanski čas)
+    # Sheet 3 — WAU (dejanski čas, samo "wau" dejavnosti)
     ws3 = wb.create_sheet("WAU")
     for c, h in enumerate(["Datum", "Opis", "Ure (dejanski čas)"], 1): _h(ws3.cell(1,c), h)
     for i, r in enumerate(wau):
@@ -198,21 +195,18 @@ if uploaded:
         total   = len(data["rap_ps"]) + len(data["dirka_za_branje"]) + len(data["wau"])
 
         if total == 0:
-            st.error("Ni bilo mogoče prepoznati aktivnosti. Surovo besedilo:")
-            st.text_area("Debug:", text[:3000], height=200)
+            st.error("Ni aktivnosti. Surovo besedilo PDF-ja za debug:")
+            st.text_area("", text[:3000], height=200)
         else:
             excel_bytes = build_excel(data)
             st.success("✅ Excel je pripravljen!")
-
             c1, c2 = st.columns(2)
             c1.markdown(f"**Učitelj:** {data['ucitelj']}")
             c2.markdown(f"**Obdobje:** {data['obdobje']}")
-
             c3, c4, c5 = st.columns(3)
-            c3.metric("RAP / RaP PS", f"{rap_h} ur",   f"{len(data['rap_ps'])} vnosov")
-            c4.metric("Dirka za branje", f"{dirka_h} ur", f"{len(data['dirka_za_branje'])} vnosov")
-            c5.metric("WAU", f"{wau_h:.2f} ur", f"{len(data['wau'])} vnosov")
-
+            c3.metric("RAP / RaP PS",    f"{rap_h} ur",    f"{len(data['rap_ps'])} vnosov")
+            c4.metric("Dirka za branje", f"{dirka_h} ur",  f"{len(data['dirka_za_branje'])} vnosov")
+            c5.metric("WAU",             f"{wau_h:.2f} ur", f"{len(data['wau'])} vnosov")
             safe = re.sub(r'[^\w]', '_', data["ucitelj"])
             st.download_button(
                 "⬇️ Prenesi Excel", excel_bytes,
@@ -221,4 +215,4 @@ if uploaded:
             )
 
 st.markdown("---")
-st.caption("Šmarje-Sap · Poročilo opravljenih ur · v2.1")
+st.caption("Šmarje-Sap · Poročilo opravljenih ur · v2.2")
