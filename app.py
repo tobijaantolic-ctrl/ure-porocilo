@@ -95,7 +95,7 @@ Poročilo:
 """
 
 def parse_pdf(text: str) -> dict:
-    model = genai.GenerativeModel("gemini-2.0-flash")
+    model = genai.GenerativeModel("gemini-1.5-flash")
     response = model.generate_content(PROMPT.format(text=text))
     raw = response.text.strip()
     # Strip markdown fences if present
