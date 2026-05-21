@@ -2,14 +2,13 @@ import streamlit as st
 from pypdf import PdfReader
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-import re
-import io
+import re, io, math
 
 st.set_page_config(page_title="Poročilo opravljenih ur", page_icon="📋", layout="centered")
 st.title("📋 Poročilo opravljenih ur")
 st.markdown("Naloži **PDF poročilo učitelja** in prejmi Excel datoteko z razčlenjenimi urami.")
 
-# ── Excel styling helpers ─────────────────────────────────────────────────────
+# ── Excel styling ─────────────────────────────────────────────────────────────
 def _border():
     s = Side(style="thin", color="AAAAAA")
     return Border(left=s, right=s, top=s, bottom=s)
@@ -41,99 +40,133 @@ def _widths(ws, widths):
     for col, w in zip("ABCDEFGH", widths):
         ws.column_dimensions[col].width = w
 
-# ── PDF parsing (no API needed) ───────────────────────────────────────────────
+# ── Counting rules ────────────────────────────────────────────────────────────
+def ped_ure(decimal: float) -> int:
+    """Pedagoška ura: vsaka začeta 45-minutna enota = 1 ura (ceil(h/0.75))."""
+    return max(1, math.ceil(decimal / 0.75))
+
+# ── Naziv cleanup ─────────────────────────────────────────────────────────────
+def clean_naziv(raw: str) -> str:
+    n = raw.strip()
+    if n.lower().startswith("wau "):
+        n = n[4:].strip()
+    # Strip trailing simple group number like "3." "0." "11." "15."
+    n = re.sub(r'\s+\d+\.\s*$', '', n).strip()
+    return n
+
+def rap_naziv(raw: str) -> str:
+    m = re.search(r'(RaP\s*(?:PS|RS)|RAP)', raw, re.IGNORECASE)
+    return m.group(1) if m else clean_naziv(raw)
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
 def extract_text(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
+# Regex — NO re.DOTALL: prevents false matches on header dates spanning lines
+PATTERN = re.compile(
+    r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'   # date
+    r'\s+([^\n\r]+?)'                       # naziv + group (same line only)
+    r'\s+\d+h\s+\d+m'                       # hh mm (discarded)
+    r'\s+\((\d+(?:[.,]\d+)?)\)'             # (decimal or integer hours)
+    r'\s+(Sistemizirana|Nesistemizirana)'    # type
+)
+
 def parse_pdf(text: str) -> dict:
-    # Extract teacher name
     ucitelj = "Neznano"
     m = re.search(r'Poročilo učitelja\s*\n([^\n]+)', text)
-    if m:
-        ucitelj = m.group(1).strip()
+    if m: ucitelj = m.group(1).strip()
 
-    # Extract period
     obdobje = ""
     m = re.search(r'Obdobje:\s*(od\s+[\d\.\s]+do\s+[\d\.\s]+)', text)
-    if m:
-        obdobje = m.group(1).strip()
-
-    # Match every activity row:
-    # Format: D. M. YYYY  naziv  group.  0h Xm (decimal)  Sistemizirana|Nesistemizirana
-    pattern = re.compile(
-        r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'   # date
-        r'\s+(.+?)'                             # naziv (non-greedy)
-        r'\s+\d+\.'                             # group number
-        r'\s+\d+h\s+\d+m'                      # time
-        r'\s+\((\d+[.,]\d+)\)'                 # (decimal hours)
-        r'\s+(Sistemizirana|Nesistemizirana)'   # type
-    )
+    if m: obdobje = m.group(1).strip()
 
     rap_ps, dirka, wau_list = [], [], []
 
-    for m in pattern.finditer(text):
-        raw_datum, naziv, ure_str, dejavnost = m.groups()
-        datum = re.sub(r'\s+', '', raw_datum)   # "2. 12. 2025" → "2.12.2025"
-        ure   = float(ure_str.replace(',', '.'))
-        naziv = naziv.strip()
+    for m in PATTERN.finditer(text):
+        raw_datum, raw_naziv, ure_str, dejavnost = m.groups()
+        datum     = re.sub(r'\s+', '', raw_datum)
+        ure       = float(ure_str.replace(',', '.'))
+        naziv_low = raw_naziv.strip().lower()
 
-        if re.search(r'\brap\s*ps\b|\brap\b', naziv, re.IGNORECASE):
-            rap_ps.append({"datum": datum, "naziv": naziv})
-        elif naziv.lower().startswith("wau"):
-            wau_list.append({"datum": datum, "opis": naziv[4:].strip(), "ure": ure})
-        elif dejavnost == "Sistemizirana":
-            dirka.append({"datum": datum, "naziv": naziv, "dejavnost": dejavnost})
+        is_wau  = naziv_low.startswith("wau")
+        is_sist = (dejavnost == "Sistemizirana")
+        is_rap  = bool(re.search(r'\brap\b', naziv_low))
+
+        if is_wau or not is_sist:
+            # WAU = nepedagoške ure → dejanski čas
+            wau_list.append({
+                "datum": datum,
+                "opis":  clean_naziv(raw_naziv.strip()),
+                "ure":   ure,
+            })
+        elif is_rap:
+            # RAP / RaP PS / RaP RS → pedagoške ure, zaokroženo
+            rap_ps.append({
+                "datum":   datum,
+                "naziv":   rap_naziv(raw_naziv.strip()),
+                "ure_st":  ped_ure(ure),
+            })
         else:
-            wau_list.append({"datum": datum, "opis": naziv, "ure": ure})
+            # Ostale sistemizirana (Knjižnična vzgoja, Halo Katra …) → pedagoške
+            dirka.append({
+                "datum":      datum,
+                "naziv":      clean_naziv(raw_naziv.strip()),
+                "dejavnost":  dejavnost,
+                "ure_st":     ped_ure(ure),
+            })
 
     return {
         "ucitelj": ucitelj,
         "obdobje": obdobje,
-        "rap_ps": rap_ps,
+        "rap_ps":  rap_ps,
         "dirka_za_branje": dirka,
-        "wau": wau_list,
+        "wau":     wau_list,
     }
 
 # ── Excel builder ─────────────────────────────────────────────────────────────
 def build_excel(data: dict) -> bytes:
-    wb  = Workbook()
+    wb    = Workbook()
     rap   = data["rap_ps"]
     dirka = data["dirka_za_branje"]
     wau   = data["wau"]
 
-    # Sheet 1 — RAP / RaP PS
+    # Sheet 1 — RAP / RaP PS / RaP RS
     ws1 = wb.active; ws1.title = "RAP_RaP_PS"
-    for c, h in enumerate(["Datum", "Naziv", "Ure (upoštevano)"], 1): _h(ws1.cell(1, c), h)
+    for c, h in enumerate(["Datum", "Naziv", "Ure (upoštevano)"], 1): _h(ws1.cell(1,c), h)
     for i, r in enumerate(rap):
-        _c(ws1.cell(i+2, 1), r["datum"],  i%2); _c(ws1.cell(i+2, 2), r["naziv"], i%2)
-        _c(ws1.cell(i+2, 3), 1, i%2, "0")
+        _c(ws1.cell(i+2,1), r["datum"],  i%2)
+        _c(ws1.cell(i+2,2), r["naziv"],  i%2)
+        _c(ws1.cell(i+2,3), r["ure_st"], i%2, "0")
     tr1 = len(rap)+2
     ws1.merge_cells(f"A{tr1}:B{tr1}"); _t(ws1.cell(tr1,1), "SKUPAJ")
-    _t(ws1.cell(tr1, 3), f"=SUM(C2:C{tr1-1})", "0")
+    _t(ws1.cell(tr1,3), f"=SUM(C2:C{tr1-1})", "0")
     _widths(ws1, [14, 22, 20])
 
-    # Sheet 2 — Dirka za branje
+    # Sheet 2 — Dirka za branje / ostale pedagoške
     ws2 = wb.create_sheet("Dirka_za_branje")
     for c, h in enumerate(["Datum", "Naziv", "Dejavnost", "Ure (upoštevano)"], 1): _h(ws2.cell(1,c), h)
     for i, r in enumerate(dirka):
-        _c(ws2.cell(i+2,1), r["datum"],      i%2); _c(ws2.cell(i+2,2), r["naziv"],      i%2)
-        _c(ws2.cell(i+2,3), r["dejavnost"],  i%2); _c(ws2.cell(i+2,4), 1, i%2, "0")
+        _c(ws2.cell(i+2,1), r["datum"],     i%2)
+        _c(ws2.cell(i+2,2), r["naziv"],     i%2)
+        _c(ws2.cell(i+2,3), r["dejavnost"], i%2)
+        _c(ws2.cell(i+2,4), r["ure_st"],    i%2, "0")
     tr2 = len(dirka)+2
     ws2.merge_cells(f"A{tr2}:C{tr2}"); _t(ws2.cell(tr2,1), "SKUPAJ")
     _t(ws2.cell(tr2,4), f"=SUM(D2:D{tr2-1})", "0")
     _widths(ws2, [14, 36, 18, 20])
 
-    # Sheet 3 — WAU
+    # Sheet 3 — WAU (dejanski čas)
     ws3 = wb.create_sheet("WAU")
     for c, h in enumerate(["Datum", "Opis", "Ure (dejanski čas)"], 1): _h(ws3.cell(1,c), h)
     for i, r in enumerate(wau):
-        _c(ws3.cell(i+2,1), r["datum"], i%2); _c(ws3.cell(i+2,2), r["opis"],  i%2)
+        _c(ws3.cell(i+2,1), r["datum"], i%2)
+        _c(ws3.cell(i+2,2), r["opis"],  i%2)
         _c(ws3.cell(i+2,3), r["ure"],   i%2, "0.00")
     tr3 = len(wau)+2
     ws3.merge_cells(f"A{tr3}:B{tr3}"); _t(ws3.cell(tr3,1), "SKUPAJ")
     _t(ws3.cell(tr3,3), f"=SUM(C2:C{tr3-1})", "0.00")
-    _widths(ws3, [14, 30, 22])
+    _widths(ws3, [14, 32, 22])
 
     # Sheet 4 — Poročilo o urah
     ws4 = wb.create_sheet("Poročilo o urah")
@@ -155,19 +188,18 @@ uploaded = st.file_uploader("📄 Naloži PDF poročilo", type=["pdf"])
 if uploaded:
     st.info(f"Datoteka: **{uploaded.name}**")
     if st.button("⚙️ Obdelaj in ustvari Excel", type="primary"):
-
         with st.spinner("Berem in analiziram PDF..."):
             text = extract_text(uploaded.read())
             data = parse_pdf(text)
 
-        rap_n   = len(data["rap_ps"])
-        dirka_n = len(data["dirka_za_branje"])
-        wau_n   = len(data["wau"])
-        wau_h   = sum(r["ure"] for r in data["wau"])
+        rap_h   = sum(r["ure_st"] for r in data["rap_ps"])
+        dirka_h = sum(r["ure_st"] for r in data["dirka_za_branje"])
+        wau_h   = sum(r["ure"]   for r in data["wau"])
+        total   = len(data["rap_ps"]) + len(data["dirka_za_branje"]) + len(data["wau"])
 
-        if rap_n + dirka_n + wau_n == 0:
-            st.error("Ni bilo mogoče prepoznati aktivnosti v PDF-ju. Pokaži surovo besedilo:")
-            st.text_area("Surovo besedilo:", text[:3000], height=200)
+        if total == 0:
+            st.error("Ni bilo mogoče prepoznati aktivnosti. Surovo besedilo:")
+            st.text_area("Debug:", text[:3000], height=200)
         else:
             excel_bytes = build_excel(data)
             st.success("✅ Excel je pripravljen!")
@@ -177,11 +209,11 @@ if uploaded:
             c2.markdown(f"**Obdobje:** {data['obdobje']}")
 
             c3, c4, c5 = st.columns(3)
-            c3.metric("RAP / RaP PS", f"{rap_n} ur")
-            c4.metric("Dirka za branje", f"{dirka_n} ur")
-            c5.metric("WAU", f"{wau_h:.2f} ur")
+            c3.metric("RAP / RaP PS", f"{rap_h} ur",   f"{len(data['rap_ps'])} vnosov")
+            c4.metric("Dirka za branje", f"{dirka_h} ur", f"{len(data['dirka_za_branje'])} vnosov")
+            c5.metric("WAU", f"{wau_h:.2f} ur", f"{len(data['wau'])} vnosov")
 
-            safe = data["ucitelj"].replace(" ", "_")
+            safe = re.sub(r'[^\w]', '_', data["ucitelj"])
             st.download_button(
                 "⬇️ Prenesi Excel", excel_bytes,
                 file_name=f"porocilo_{safe}.xlsx",
@@ -189,4 +221,4 @@ if uploaded:
             )
 
 st.markdown("---")
-st.caption("Šmarje-Sap · Poročilo opravljenih ur · Brez AI API")
+st.caption("Šmarje-Sap · Poročilo opravljenih ur · v2.1")
