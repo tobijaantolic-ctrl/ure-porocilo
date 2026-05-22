@@ -41,7 +41,13 @@ VRSTICA = re.compile(
 
 def preberi_pdf(pdf_bytes: bytes) -> str:
     reader = PdfReader(io.BytesIO(pdf_bytes))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+    # Nekateri nazivi se v PDF-ju prelomijo v dve vrstici (npr. Gumitvist).
+    # Nadaljevalna vrstica začne z razrednim znakom pred časom: "2_5 8. 0h 45m"
+    # Spojimo jo s predhodno vrstico.
+    import re as _re
+    text = _re.sub(r'\n([\w_]+\s+\d+\.\s+\d+h\s+\d+m)', r' \1', text)
+    return text
 
 def razcleni_pdf(text: str) -> dict:
     ucitelj = "Neznano"
