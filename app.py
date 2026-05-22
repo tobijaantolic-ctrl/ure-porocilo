@@ -4,54 +4,55 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import re, io, math
 
-st.set_page_config(page_title="Poročilo opravljenih ur", page_icon="📋", layout="centered")
+st.set_page_config(page_title="Porocilo opravljenih ur", page_icon="📋", layout="centered")
 st.title("📋 Poročilo opravljenih ur")
 st.markdown("Naloži **PDF poročilo učitelja** in prejmi Excel datoteko z razčlenjenimi urami.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PRAVILO RAZVRŠČANJA (edino merilo):
-#   naziv se ZAČNE z "wau"  →  WAU  (dejanski čas, ne zaokroži)
-#   naziv vsebuje "RaP"     →  RAP  (pedagoška: ceil(h/0.75))
-#   vse ostalo              →  Dirka za branje (pedagoška: ceil(h/0.75))
+# PRAVILA:
+#   naziv ZAČNE z "wau"  →  WAU  (dejanski čas)
+#   naziv vsebuje "RaP"  →  RAP  (pedagoška: ceil(h/0.75))
+#   vse ostalo           →  Dirka za branje (pedagoška: ceil(h/0.75))
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pedagoske_ure(decimal: float) -> int:
+def pedagoske_ure(decimal):
     return max(1, math.ceil(decimal / 0.75))
 
-def ocisti_naziv(raw: str) -> str:
+def ocisti_naziv(raw):
     n = raw.strip()
     if n.lower().startswith("wau "):
         n = n[4:].strip()
-    # Odstrani priponko razreda: " 3."  " 11."  " 0."
     n = re.sub(r'\s+\d+\.\s*$', '', n).strip()
     return n
 
-def rap_tip(raw: str) -> str:
+def rap_tip(raw):
     m = re.search(r'(RaP\s*(?:PS|RS)|RAP)', raw, re.IGNORECASE)
     return m.group(1) if m else ocisti_naziv(raw)
 
-# Regex — brez DOTALL da ne preskakuje vrstic
 VRSTICA = re.compile(
-    r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'   # datum
-    r'\s+([^\n\r]+?)'                       # naziv + skupina (ena vrstica)
-    r'\s+\d+h\s+\d+m'                       # čas (zavržemo)
-    r'\s+\((\d+(?:[.,]\d+)?)\)'             # (ure decimalno)
-    r'\s+(Sistemizirana|Nesistemizirana)'    # tip
+    r'(\d{1,2}\.\s*\d{1,2}\.\s*\d{4})'
+    r'\s+([^\n\r]+?)'
+    r'\s+\d+h\s+\d+m'
+    r'\s+\((\d+(?:[.,]\d+)?)\)'
+    r'\s+(Sistemizirana|Nesistemizirana)'
 )
 
-def preberi_pdf(pdf_bytes: bytes) -> str:
+# Regex ki ujame nadaljevalno vrstico:
+# "Gumitvist in druge igre brez wifija\n2_5 8. 0h 45m" → spoji v eno vrstico
+CONTINUATION = re.compile('\n' + r'([\w_]+\s+\d+\.\s+\d+h\s+\d+m)')
+
+def preberi_pdf(pdf_bytes):
     reader = PdfReader(io.BytesIO(pdf_bytes))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
-    # Nekateri nazivi se v PDF-ju prelomijo v dve vrstici (npr. Gumitvist).
-    # Nadaljevalna vrstica začne z razrednim znakom pred časom: "2_5 8. 0h 45m"
-    # Spojimo jo s predhodno vrstico.
-    import re as _re
-    text = _re.sub(r'\n([\w_]+\s+\d+\.\s+\d+h\s+\d+m)', r' \1', text)
+    # Spoji prelomljene nazive dejavnosti z nadaljevalno vrstico
+    text = CONTINUATION.sub(r' \1', text)
     return text
 
-def razcleni_pdf(text: str) -> dict:
+def razcleni_pdf(text):
     ucitelj = "Neznano"
-    m = re.search(r'Poročilo učitelja\s*\n([^\n]+)', text)
+    m = re.search(r'Porocilo ucitelja\s*\n([^\n]+)', text)
+    if not m:
+        m = re.search(r'Poro.{1,3}ilo u.{1,3}itelja\s*\n([^\n]+)', text)
     if m:
         ucitelj = m.group(1).strip()
 
@@ -69,35 +70,13 @@ def razcleni_pdf(text: str) -> dict:
         niz   = raw_naziv.strip()
 
         if niz.lower().startswith("wau"):
-            # ── WAU: SAMO "wau" predpona ──────────────────────────────────
-            wau.append({
-                "datum": datum,
-                "opis":  ocisti_naziv(niz),
-                "ure":   ure,
-            })
+            wau.append({"datum": datum, "opis": ocisti_naziv(niz), "ure": ure})
         elif re.search(r'\brap\b', niz, re.IGNORECASE):
-            # ── RAP: vsebuje "RaP" ────────────────────────────────────────
-            rap.append({
-                "datum":   datum,
-                "naziv":   rap_tip(niz),
-                "ure_st":  pedagoske_ure(ure),
-            })
+            rap.append({"datum": datum, "naziv": rap_tip(niz), "ure_st": pedagoske_ure(ure)})
         else:
-            # ── VSE OSTALO: pedagoška ura ─────────────────────────────────
-            dirka.append({
-                "datum":     datum,
-                "naziv":     ocisti_naziv(niz),
-                "dejavnost": _tip,
-                "ure_st":    pedagoske_ure(ure),
-            })
+            dirka.append({"datum": datum, "naziv": ocisti_naziv(niz), "dejavnost": _tip, "ure_st": pedagoske_ure(ure)})
 
-    return {
-        "ucitelj": ucitelj,
-        "obdobje": obdobje,
-        "rap":   rap,
-        "dirka": dirka,
-        "wau":   wau,
-    }
+    return {"ucitelj": ucitelj, "obdobje": obdobje, "rap": rap, "dirka": dirka, "wau": wau}
 
 # ── Excel styling ─────────────────────────────────────────────────────────────
 def _rob():
@@ -133,15 +112,14 @@ def sirine(ws, widths):
     for col, w in zip("ABCDEFGH", widths):
         ws.column_dimensions[col].width = w
 
-def ustvari_excel(data: dict) -> bytes:
+def ustvari_excel(data):
     wb    = Workbook()
     rap   = data["rap"]
     dirka = data["dirka"]
     wau   = data["wau"]
 
-    # Sheet 1 — RAP
     ws1 = wb.active; ws1.title = "RAP_RaP_PS"
-    for c, h in enumerate(["Datum", "Naziv", "Ure (upoštevano)"], 1):
+    for c, h in enumerate(["Datum", "Naziv", "Ure (upostevano)"], 1):
         glava(ws1.cell(1, c), h)
     for i, r in enumerate(rap):
         celica(ws1.cell(i+2, 1), r["datum"],  i%2)
@@ -153,9 +131,8 @@ def ustvari_excel(data: dict) -> bytes:
     skupaj(ws1.cell(tr1, 3), f"=SUM(C2:C{tr1-1})", "0")
     sirine(ws1, [14, 22, 20])
 
-    # Sheet 2 — Dirka za branje (vse ostale pedagoške)
     ws2 = wb.create_sheet("Dirka_za_branje")
-    for c, h in enumerate(["Datum", "Naziv", "Dejavnost", "Ure (upoštevano)"], 1):
+    for c, h in enumerate(["Datum", "Naziv", "Dejavnost", "Ure (upostevano)"], 1):
         glava(ws2.cell(1, c), h)
     for i, r in enumerate(dirka):
         celica(ws2.cell(i+2, 1), r["datum"],     i%2)
@@ -168,9 +145,8 @@ def ustvari_excel(data: dict) -> bytes:
     skupaj(ws2.cell(tr2, 4), f"=SUM(D2:D{tr2-1})", "0")
     sirine(ws2, [14, 36, 18, 20])
 
-    # Sheet 3 — WAU (samo "wau" predpona, dejanski čas)
     ws3 = wb.create_sheet("WAU")
-    for c, h in enumerate(["Datum", "Opis", "Ure (dejanski čas)"], 1):
+    for c, h in enumerate(["Datum", "Opis", "Ure (dejanski cas)"], 1):
         glava(ws3.cell(1, c), h)
     for i, r in enumerate(wau):
         celica(ws3.cell(i+2, 1), r["datum"], i%2)
@@ -182,8 +158,7 @@ def ustvari_excel(data: dict) -> bytes:
     skupaj(ws3.cell(tr3, 3), f"=SUM(C2:C{tr3-1})", "0.00")
     sirine(ws3, [14, 32, 22])
 
-    # Sheet 4 — Poročilo o urah
-    ws4 = wb.create_sheet("Poročilo o urah")
+    ws4 = wb.create_sheet("Porocilo o urah")
     for c, h in enumerate(["Tabela", "Ure"], 1):
         glava(ws4.cell(1, c), h)
     for i, (lbl, fml) in enumerate([
@@ -202,11 +177,11 @@ def ustvari_excel(data: dict) -> bytes:
     return buf.getvalue()
 
 # ── UI ────────────────────────────────────────────────────────────────────────
-uploaded = st.file_uploader("📄 Naloži PDF poročilo", type=["pdf"])
+uploaded = st.file_uploader("📄 Nalozi PDF porocilo", type=["pdf"])
 
 if uploaded:
     st.info(f"Datoteka: **{uploaded.name}**")
-    if st.button("⚙️ Obdelaj in ustvari Excel", type="primary"):
+    if st.button("Obdelaj in ustvari Excel", type="primary"):
         with st.spinner("Berem in analiziram PDF..."):
             text = preberi_pdf(uploaded.read())
             data = razcleni_pdf(text)
@@ -224,7 +199,7 @@ if uploaded:
             st.success("✅ Excel je pripravljen!")
 
             c1, c2 = st.columns(2)
-            c1.markdown(f"**Učitelj:** {data['ucitelj']}")
+            c1.markdown(f"**Ucitelj:** {data['ucitelj']}")
             c2.markdown(f"**Obdobje:** {data['obdobje']}")
 
             c3, c4, c5 = st.columns(3)
@@ -234,10 +209,10 @@ if uploaded:
 
             safe = re.sub(r'[^\w]', '_', data["ucitelj"])
             st.download_button(
-                "⬇️ Prenesi Excel", excel_bytes,
+                "Prenesi Excel", excel_bytes,
                 file_name=f"porocilo_{safe}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
 st.markdown("---")
-st.caption("Šmarje-Sap · Poročilo opravljenih ur · v3.0")
+st.caption("Smarje-Sap - Porocilo opravljenih ur - v3.1")
